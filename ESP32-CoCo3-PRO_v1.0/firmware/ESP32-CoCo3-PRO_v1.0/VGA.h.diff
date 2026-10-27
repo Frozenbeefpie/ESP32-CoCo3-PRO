@@ -1,0 +1,30 @@
+--- vga/VGA.h.orig	2026-09-25 15:18:20.212379880 -0400
++++ vga/VGA.h	2026-09-25 15:18:46.576681771 -0400
+@@ -4,6 +4,7 @@
+  * File         : VGA.h
+  *
+  * Updated      : 2026-08-30 by Luc Dion
++ *                2026-09-25 bascule rapide de mode (prepareAlternate/switchToAlternate)
+  *
+  *******************************************************************************/
+ 
+@@ -31,6 +32,19 @@
+ 	~VGA();
+ 	bool init(const PinConfig pins, const Mode mode, int bits);
+ 	bool Reinit(const PinConfig pins, const Mode mode, int bits);
++
++	// Bascule rapide entre deux modes au MÊME balayage vertical et à la même
++	// profondeur (ex. 320x240 4:3 <-> 640 GIME) : le tampon du second mode
++	// est alloué une seule fois (prepareAlternate), puis switchToAlternate()
++	// échange mode + tampon en ne reprogrammant que l'horloge pixel et les
++	// durées horizontales, SANS remise à zéro du périphérique LCD_CAM ni
++	// réallocation : HSYNC/VSYNC ne s'interrompent que quelques µs, le
++	// moniteur ne refait pas sa détection. Reinit() libère le tampon alterné.
++	bool prepareAlternate(const Mode altMode);
++	bool hasAlternate(const Mode m) const;
++	bool switchToAlternate();
++	Mode altMode;
++	DMAVideoBuffer *altBuffer;
+ 	void deinit();
+ 	bool start();
+ 	bool stop();

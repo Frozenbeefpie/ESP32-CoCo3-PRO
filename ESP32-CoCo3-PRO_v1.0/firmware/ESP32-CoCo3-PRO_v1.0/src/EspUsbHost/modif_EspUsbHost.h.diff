@@ -1,0 +1,69 @@
+// ESP32-CoCo3-PRO
+// Auteur: Luc Dion 2026-10-26
+
+--- /tmp/claude-0/h270	2026-10-02 17:38:35.795194554 -0400
++++ EspUsbHost.h	2026-10-02 20:16:08.182798040 -0400
+@@ -156,7 +156,8 @@
+ 
+ struct EspUsbHostConfig
+ {
+-  uint32_t taskStackSize = 8192;
++  uint32_t taskStackSize = 8192;      // pile de la tâche client (rappels clavier/souris)
++  uint32_t hostTaskStackSize = 0;     // CoCo3 6d : pile de la tâche hôte (0 = taskStackSize)
+   UBaseType_t taskPriority = 5;
+   BaseType_t taskCore = tskNO_AFFINITY;
+   EspUsbHostPort port = ESP_USB_HOST_PORT_DEFAULT;
+@@ -1305,6 +1306,19 @@
+   void printDeviceInfo(uint8_t address, bool includeHubInfo = false, Print &out = Serial);
+   void printAllDeviceInfo(Print &out = Serial);
+ 
++  // ESP32-CoCo3 6c : filtre des interfaces HID (voir EspUsbHost.cpp, « CoCo3 6c »).
++  // Le contrôleur hôte de l'ESP32-S3 n'a que 8 canaux : chaque interface réclamée
++  // en prend un par point d'accès. Avec le filtre, seules les interfaces clavier,
++  // souris et manette sont réclamées ; le clavier d'un récepteur combiné
++  // clavier+souris n'est réclamé que si aucun autre clavier n'est branché.
++  void setHidInterfaceFilter(bool enabled) { cocoHidFilter_ = enabled; }
++  bool hidInterfaceFilter() const { return cocoHidFilter_; }
++  // CoCo3 6d : marge restante des piles des deux tâches (octets jamais utilisés)
++  uint32_t hostTaskStackFree() const { return taskHandle_ ? (uint32_t)uxTaskGetStackHighWaterMark(taskHandle_) : 0; }
++  uint32_t clientTaskStackFree() const { return clientTaskHandle_ ? (uint32_t)uxTaskGetStackHighWaterMark(clientTaskHandle_) : 0; }
++  uint32_t hostTaskStackSize() const { return config_.hostTaskStackSize ? config_.hostTaskStackSize : config_.taskStackSize; }
++  uint32_t clientTaskStackSize() const { return config_.taskStackSize; }
++
+ private:
+   template <typename Callback>
+   struct ListenerSlot
+@@ -1803,6 +1817,33 @@
+   bool currentInterfaceClaimed_ = false;
+   esp_err_t currentClaimResult_ = ESP_OK;
+ 
++  // ESP32-CoCo3 6c : interfaces HID en attente de décision (voir EspUsbHost.cpp)
++  struct CocoHidPending
++  {
++    bool inUse = false;
++    usb_device_handle_t handle = nullptr;
++    uint8_t iface = 0;
++    uint8_t alt = 0;
++    uint8_t state = 0;
++    uint8_t tries = 0;   // 6d : nouvelles tentatives après ESP_ERR_NO_MEM
++    uint32_t sinceMs = 0;
++  };
++  static constexpr uint8_t COCO_HID_MAX_PENDING = 8;
++  CocoHidPending cocoHidPending_[COCO_HID_MAX_PENDING];
++  bool cocoHidFilter_ = true;
++  bool cocoLatePass_ = false;
++  uint32_t cocoLastNewDeviceMs_ = 0;
++  esp_err_t cocoDecideHidClaim(DeviceState &device, const usb_intf_desc_t *intf);
++  void cocoOnHidReportDescriptor(DeviceState &device, uint8_t iface, const uint8_t *data, size_t length);
++  void cocoProcessPendingHid();
++  bool cocoClaimHidLate(DeviceState &device, uint8_t iface, uint8_t alt);
++  void cocoSetInterfaceState(DeviceState &device, uint8_t iface, uint8_t alt, esp_err_t state);
++  bool cocoOtherKeyboardClaimed(const DeviceState &device) const;
++  void cocoForgetDevice(usb_device_handle_t handle);
++  void cocoQueueRetry(usb_device_handle_t handle, uint8_t iface, uint8_t alt, uint8_t tries);
++  bool cocoTrimHidOut(DeviceState &device, usb_intf_desc_t *intf);   // 6e
++  bool cocoOutTrimmed_ = false;                                       // 6e : interface courante
++
+   EspUsbHostKeyboardLayout keyboardLayout_ = ESP_USB_HOST_KEYBOARD_LAYOUT_EN_US;
+ 
+   std::shared_ptr<DeviceCallback> deviceConnectedCallback_;

@@ -1,0 +1,644 @@
+// ESP32-CoCo3-PRO
+// Auteur: Luc Dion 2026-10-26
+
+--- /home/claude/usb27/EspUsbHost.cpp.orig270	2026-10-02 17:32:48.938555238 -0400
++++ EspUsbHost.cpp	2026-10-02 20:22:43.057912076 -0400
+@@ -1591,11 +1591,11 @@
+   BaseType_t created;
+   if (config_.taskCore == tskNO_AFFINITY)
+   {
+-    created = xTaskCreate(taskEntry, "EspUsbHost", config_.taskStackSize, this, config_.taskPriority, &taskHandle_);
++    created = xTaskCreate(taskEntry, "EspUsbHost", hostTaskStackSize(), this, config_.taskPriority, &taskHandle_);   // CoCo3 6d
+   }
+   else
+   {
+-    created = xTaskCreatePinnedToCore(taskEntry, "EspUsbHost", config_.taskStackSize, this, config_.taskPriority, &taskHandle_, config_.taskCore);
++    created = xTaskCreatePinnedToCore(taskEntry, "EspUsbHost", hostTaskStackSize(), this, config_.taskPriority, &taskHandle_, config_.taskCore);   // CoCo3 6d
+   }
+ 
+   if (created != pdPASS)
+@@ -6285,6 +6285,7 @@
+         finalizeDisconnectedDevice(device);
+       }
+     }
++    cocoProcessPendingHid();   // CoCo3 6c
+     for (DeviceState &device : devices_)
+     {
+       if (!device.inUse || !deviceHasKeyboard(device) || !device.keyboardLedDirty || device.keyboardLedPending)
+@@ -6424,6 +6425,7 @@
+ void EspUsbHost::handleNewDevice(uint8_t address)
+ {
+   ESP_LOGI(TAG, "Device connected: address=%u", address);
++  cocoLastNewDeviceMs_ = millis();   // CoCo3 6c
+   DeviceState *device = allocateDevice();
+   if (!device)
+   {
+@@ -6962,7 +6964,8 @@
+     currentAudioSampleRateResolution_ = 0;
+     currentInterfaceClaimed_ = false;
+     currentClaimResult_ = ESP_OK;
+-    if (device->interfaceInfoCount < ESP_USB_HOST_MAX_INTERFACES)
++    cocoOutTrimmed_ = false;   // CoCo3 6e
++    if (!cocoLatePass_ && device->interfaceInfoCount < ESP_USB_HOST_MAX_INTERFACES)   // CoCo3 6c
+     {
+       EspUsbHostInterfaceInfo &info = device->interfaceInfos[device->interfaceInfoCount++];
+       info.number = intf->bInterfaceNumber;
+@@ -7008,7 +7011,24 @@
+     const bool isCdcAcmDataInterface = currentInterfaceClass_ == USB_CLASS_CDC_DATA_VALUE &&
+                                        device->hasCdcControlInterface &&
+                                        !device->hasCdcDataInterface;
+-    if (currentInterfaceClass_ == USB_CLASS_HID_VALUE ||
++    // CoCo3 6c : filtre HID. Une interface HID non utile (touches multimédia,
++    // contrôle système, fonctions du fabricant) n'est pas réclamée : elle ne
++    // prend aucun canal. Les cas douteux sont mis en attente et réclamés plus
++    // tard (cocoProcessPendingHid) au besoin.
++    esp_err_t cocoHidDecision = ESP_OK;
++    if (currentInterfaceClass_ == USB_CLASS_HID_VALUE && cocoHidFilter_ && !cocoLatePass_)
++    {
++      cocoHidDecision = cocoDecideHidClaim(*device, intf);
++      if (cocoHidDecision != ESP_OK)
++      {
++        currentClaimResult_ = cocoHidDecision;
++        currentInterfaceClaimed_ = false;
++        cocoSetInterfaceState(*device, currentInterfaceNumber_, currentInterfaceAlternate_, cocoHidDecision);
++        ESP_LOGI(TAG, "CoCo3: HID interface %u %s", currentInterfaceNumber_,
++                 cocoHidDecision == ESP_ERR_NOT_FINISHED ? "deferred" : "skipped");
++      }
++    }
++    if ((currentInterfaceClass_ == USB_CLASS_HID_VALUE && cocoHidDecision == ESP_OK) ||
+         isCdcAcmControlInterface ||
+         isCdcAcmDataInterface ||
+         isAudioControlInterface ||
+@@ -7017,6 +7037,21 @@
+         isMscInterface ||
+         isVendorSerialInterface)
+     {
++      // CoCo3 6e : interface HID avec point d'accès d'interruption OUT (vibration,
++      // voyants de manette) : seul le point d'accès IN est réclamé -> 1 canal de moins.
++      if (currentInterfaceClass_ == USB_CLASS_HID_VALUE && cocoHidFilter_ &&
++          cocoTrimHidOut(*device, const_cast<usb_intf_desc_t *>(intf)))
++      {
++        cocoOutTrimmed_ = true;
++        for (uint8_t i = 0; i < device->interfaceInfoCount; i++)
++        {
++          EspUsbHostInterfaceInfo &info = device->interfaceInfos[i];
++          if (info.number == currentInterfaceNumber_ && info.alternate == currentInterfaceAlternate_)
++          {
++            info.endpointCount = intf->bNumEndpoints;
++          }
++        }
++      }
+       currentClaimResult_ = usb_host_interface_claim(clientHandle_, device->handle, currentInterfaceNumber_, intf->bAlternateSetting);
+       currentInterfaceClaimed_ = currentClaimResult_ == ESP_OK;
+       for (uint8_t i = 0; i < device->interfaceInfoCount; i++)
+@@ -7116,6 +7151,12 @@
+                  static_cast<unsigned>(endpointChannelCount()),
+                  static_cast<unsigned>(maxEndpointChannelCount()));
+         setLastError(currentClaimResult_);
++        // CoCo3 6d : manque de RAM interne (DMA) passager -> nouvelle tentative
++        // plus tard. ESP_ERR_NOT_SUPPORTED = plus de canal : inutile.
++        if (currentInterfaceClass_ == USB_CLASS_HID_VALUE && currentClaimResult_ == ESP_ERR_NO_MEM && !cocoLatePass_)
++        {
++          cocoQueueRetry(device->handle, currentInterfaceNumber_, currentInterfaceAlternate_, 0);
++        }
+       }
+     }
+     break;
+@@ -7171,7 +7212,7 @@
+   case USB_ENDPOINT_DESC:
+   {
+     const usb_ep_desc_t *ep = reinterpret_cast<const usb_ep_desc_t *>(data);
+-    if (device->endpointInfoCount < ESP_USB_HOST_MAX_ENDPOINTS)
++    if (!cocoLatePass_ && device->endpointInfoCount < ESP_USB_HOST_MAX_ENDPOINTS)   // CoCo3 6c
+     {
+       EspUsbHostEndpointInfo &info = device->endpointInfos[device->endpointInfoCount++];
+       info.address = ep->bEndpointAddress;
+@@ -7411,6 +7452,15 @@
+     if (currentClaimResult_ == ESP_OK &&
+         currentInterfaceClass_ == USB_CLASS_HID_VALUE &&
+         !isIn &&
++        isInterrupt &&
++        cocoOutTrimmed_)   // CoCo3 6e : OUT non réclamé, inutilisable
++    {
++      ESP_LOGI(TAG, "CoCo3: HID interrupt OUT ep=0x%02x not claimed (channel saved)", ep->bEndpointAddress);
++      return;
++    }
++    if (currentClaimResult_ == ESP_OK &&
++        currentInterfaceClass_ == USB_CLASS_HID_VALUE &&
++        !isIn &&
+         isInterrupt)
+     {
+       device->hasVendorInterface = true;
+@@ -7468,6 +7518,10 @@
+   }
+ 
+   case USB_HID_DESC:
++    if (cocoLatePass_)   // CoCo3 6c : déjà demandé à la première passe
++    {
++      break;
++    }
+     if (data[0] >= 9 && device->hidReportDescriptorCount < ESP_USB_HOST_MAX_HID_REPORT_DESCRIPTORS)
+     {
+       const uint8_t descriptorCount = data[5];
+@@ -8137,6 +8191,8 @@
+     if (device)
+     {
+       host->parseHIDReportDescriptor(*device, context->descriptor);
++      host->cocoOnHidReportDescriptor(*device, context->descriptor.interfaceNumber,
++                                      context->descriptor.data, context->descriptor.length);   // CoCo3 6c
+     }
+     if (host->hidReportDescriptorCallback_)
+     {
+@@ -8291,7 +8347,14 @@
+       {
+         handleMouse(*endpoint, transfer->data_buffer, transfer->actual_num_bytes);
+       }
+-      else if (transfer->actual_num_bytes >= 9 && transfer->data_buffer[0] == ESP_USB_HOST_HID_REPORT_ID_KEYBOARD)
++      // CoCo3 6f : le rapport n° 1 n'est un rapport clavier QUE sur une interface
++      // clavier (protocole « boot » 1, ou champs de la page Keyboard vus dans son
++      // descripteur). Avant, toute interface HID dont le 1er octet valait 1 (une
++      // manette dont le rapport porte le n° 1) était décodée comme un clavier :
++      // axes et boutons devenaient des touches fantômes.
++      else if (transfer->actual_num_bytes >= 9 && transfer->data_buffer[0] == ESP_USB_HOST_HID_REPORT_ID_KEYBOARD &&
++               (endpoint->interfaceProtocol == HID_PROTOCOL_KEYBOARD_VALUE ||
++                (device && device->keyboardLayoutInterface == endpoint->interfaceNumber)))
+       {
+         handleKeyboard(*endpoint, transfer->data_buffer + 1, transfer->actual_num_bytes - 1, transfer->data_buffer, transfer->actual_num_bytes);
+       }
+@@ -9236,6 +9299,7 @@
+ 
+ void EspUsbHost::resetDeviceState(DeviceState &device)
+ {
++  cocoForgetDevice(device.handle);   // CoCo3 6c
+   // Free the reusable OUT transfer (it references this device's now-stale handle),
+   // but keep the TX lock / completion semaphore alive across the reset: they are
+   // created once per device slot and reused for whatever device next occupies it.
+@@ -12271,3 +12335,468 @@
+   }
+   return index;
+ }
++
++// ===========================================================================
++// ESP32-CoCo3 6c (2026-10-02) : filtre des interfaces HID
++// ---------------------------------------------------------------------------
++// Le contrôleur hôte de l'ESP32-S3 n'a que 8 canaux. Chaque périphérique en
++// prend 1 pour EP0, chaque interface réclamée 1 par point d'accès, et un hub
++// 1 de plus pour son point d'accès d'état. Sans filtre, toutes les interfaces
++// HID sont réclamées : touches multimédia, contrôle système, fonctions du
++// fabricant... et le 3e périphérique derrière un hub échoue (EP Alloc
++// ESP_ERR_NO_MEM, sans rapport avec la RAM).
++//
++// Règles :
++//  - souris « boot » (sous-classe 1, protocole 2) : réclamée tout de suite ;
++//  - clavier « boot » (1/1) : réclamé tout de suite, sauf sur un récepteur
++//    combiné (le même périphérique a aussi une souris « boot ») : on attend
++//    que les branchements se calment (3 s), puis on le réclame seulement si
++//    aucun autre clavier n'est réclamé et (6g) s'il reste ensuite 2 canaux
++//    libres pour le retour d'un clavier. Sinon il reste en réserve et sera
++//    réclamé si l'autre clavier est débranché ;
++//  - autre interface HID : on attend son descripteur de rapport (demandé par
++//    EP0, sans canal). Collection d'application clavier, manette/joystick ou
++//    souris (si le périphérique n'a pas déjà une souris « boot ») : réclamée.
++//    Sinon (Consumer Control, System Control, page du fabricant) : ignorée.
++//    Sans descripteur après 3 s : réclamée si le périphérique n'a aucune
++//    interface « boot » (manette probable), ignorée sinon.
++// L'état est visible par getInterfaces() : claimResult = ESP_ERR_NOT_FINISHED
++// (en attente / en réserve) ou ESP_ERR_NOT_ALLOWED (ignorée, 6d ; la 6c
++// utilisait ESP_ERR_NOT_SUPPORTED, qui est aussi le code « plus de canal »
++// d'ESP-IDF). ESP_ERR_NO_MEM = RAM interne DMA insuffisante (6d : nouvelle
++// tentative jusqu'à 5 fois, toutes les 1,5 s).
++// ===========================================================================
++
++static constexpr uint8_t COCO_HID_WAIT_DESC = 1;     // attend le descripteur de rapport
++static constexpr uint8_t COCO_HID_WAIT_SETTLE = 2;   // clavier de récepteur combiné
++static constexpr uint8_t COCO_HID_CLAIM = 3;         // à réclamer dans la boucle du client
++static constexpr uint8_t COCO_HID_RETRY = 4;         // 6d : réclamation échouée faute de RAM
++static constexpr uint8_t COCO_HID_MAX_TRIES = 5;
++static constexpr uint32_t COCO_HID_RETRY_MS = 1500;
++static constexpr uint32_t COCO_HID_SETTLE_MS = 3000;
++static constexpr uint32_t COCO_HID_DESC_TIMEOUT_MS = 3000;
++
++// Collections d'application de premier niveau : bit 0 clavier/pavé, bit 1
++// souris, bit 2 joystick/manette/multi-axes.
++static uint8_t cocoClassifyReportDescriptor(const uint8_t *d, size_t len)
++{
++  uint8_t mask = 0;
++  uint32_t usagePage = 0;
++  uint32_t usage = 0;
++  bool haveUsage = false;
++  int depth = 0;
++  size_t i = 0;
++  while (i < len)
++  {
++    const uint8_t b = d[i];
++    if (b == 0xFE)   // élément long
++    {
++      if (i + 1 >= len)
++      {
++        break;
++      }
++      i += 3 + d[i + 1];
++      continue;
++    }
++    uint8_t size = b & 0x03;
++    if (size == 3)
++    {
++      size = 4;
++    }
++    if (i + 1 + size > len)
++    {
++      break;
++    }
++    uint32_t v = 0;
++    for (uint8_t k = 0; k < size; k++)
++    {
++      v |= static_cast<uint32_t>(d[i + 1 + k]) << (8 * k);
++    }
++    switch (b & 0xFC)
++    {
++    case 0x04:   // Usage Page (global)
++      usagePage = v;
++      break;
++    case 0x08:   // Usage (local)
++      if (!haveUsage)
++      {
++        usage = size == 4 ? v : ((usagePage << 16) | v);
++        haveUsage = true;
++      }
++      break;
++    case 0xA0:   // Collection
++      if (depth == 0 && v == 0x01 && haveUsage)
++      {
++        const uint16_t page = static_cast<uint16_t>(usage >> 16);
++        const uint16_t u = static_cast<uint16_t>(usage & 0xFFFF);
++        if (page == 0x01 && (u == 0x06 || u == 0x07))
++        {
++          mask |= 0x01;
++        }
++        else if (page == 0x01 && u == 0x02)
++        {
++          mask |= 0x02;
++        }
++        else if (page == 0x01 && (u == 0x04 || u == 0x05 || u == 0x08))
++        {
++          mask |= 0x04;
++        }
++      }
++      depth++;
++      haveUsage = false;
++      break;
++    case 0xC0:   // End Collection
++      if (depth > 0)
++      {
++        depth--;
++      }
++      haveUsage = false;
++      break;
++    case 0x80:   // Input
++    case 0x90:   // Output
++    case 0xB0:   // Feature
++      haveUsage = false;
++      break;
++    default:
++      break;
++    }
++    i += 1 + size;
++  }
++  return mask;
++}
++
++// Le périphérique a-t-il une interface HID « boot » du protocole donné (0 = l'une ou l'autre) ?
++static bool cocoConfigHasBootHid(usb_device_handle_t handle, uint8_t protocol)
++{
++  const usb_config_desc_t *cfg = nullptr;
++  if (!handle || usb_host_get_active_config_descriptor(handle, &cfg) != ESP_OK || !cfg)
++  {
++    return false;
++  }
++  const uint8_t *p = reinterpret_cast<const uint8_t *>(cfg);
++  for (int i = 0; i < cfg->wTotalLength;)
++  {
++    const uint8_t length = p[i];
++    if (length < 2 || i + length > cfg->wTotalLength)
++    {
++      break;
++    }
++    if (p[i + 1] == USB_INTERFACE_DESC && length >= 9)
++    {
++      const usb_intf_desc_t *intf = reinterpret_cast<const usb_intf_desc_t *>(&p[i]);
++      if (intf->bInterfaceClass == USB_CLASS_HID_VALUE &&
++          intf->bInterfaceSubClass == HID_SUBCLASS_BOOT_VALUE &&
++          (protocol == 0 ? (intf->bInterfaceProtocol == HID_PROTOCOL_KEYBOARD_VALUE ||
++                            intf->bInterfaceProtocol == HID_PROTOCOL_MOUSE_VALUE)
++                         : intf->bInterfaceProtocol == protocol))
++      {
++        return true;
++      }
++    }
++    i += length;
++  }
++  return false;
++}
++
++void EspUsbHost::cocoSetInterfaceState(DeviceState &device, uint8_t iface, uint8_t alt, esp_err_t state)
++{
++  for (uint8_t i = 0; i < device.interfaceInfoCount; i++)
++  {
++    EspUsbHostInterfaceInfo &info = device.interfaceInfos[i];
++    if (info.number == iface && info.alternate == alt)
++    {
++      info.claimAttempted = true;
++      info.claimResult = state;
++      break;
++    }
++  }
++}
++
++esp_err_t EspUsbHost::cocoDecideHidClaim(DeviceState &device, const usb_intf_desc_t *intf)
++{
++  const bool boot = intf->bInterfaceSubClass == HID_SUBCLASS_BOOT_VALUE;
++  if (boot && intf->bInterfaceProtocol == HID_PROTOCOL_MOUSE_VALUE)
++  {
++    return ESP_OK;
++  }
++  uint8_t state = COCO_HID_WAIT_DESC;
++  if (boot && intf->bInterfaceProtocol == HID_PROTOCOL_KEYBOARD_VALUE)
++  {
++    if (!cocoConfigHasBootHid(device.handle, HID_PROTOCOL_MOUSE_VALUE))
++    {
++      return ESP_OK;   // clavier seul
++    }
++    state = COCO_HID_WAIT_SETTLE;   // récepteur combiné clavier + souris
++  }
++  for (CocoHidPending &p : cocoHidPending_)
++  {
++    if (!p.inUse)
++    {
++      p.inUse = true;
++      p.handle = device.handle;
++      p.iface = intf->bInterfaceNumber;
++      p.alt = intf->bAlternateSetting;
++      p.state = state;
++      p.tries = 0;
++      p.sinceMs = millis();
++      return ESP_ERR_NOT_FINISHED;
++    }
++  }
++  return ESP_OK;   // table pleine : comportement d'origine
++}
++
++void EspUsbHost::cocoOnHidReportDescriptor(DeviceState &device, uint8_t iface, const uint8_t *data, size_t length)
++{
++  for (CocoHidPending &p : cocoHidPending_)
++  {
++    if (!p.inUse || p.handle != device.handle || p.iface != iface || p.state != COCO_HID_WAIT_DESC)
++    {
++      continue;
++    }
++    const uint8_t mask = cocoClassifyReportDescriptor(data, length);
++    const bool hasBootMouse = cocoConfigHasBootHid(device.handle, HID_PROTOCOL_MOUSE_VALUE);
++    const bool useful = (mask & 0x01) || (mask & 0x04) || ((mask & 0x02) && !hasBootMouse);
++    ESP_LOGI(TAG, "CoCo3: HID iface=%u collections=0x%02x -> %s", iface, mask, useful ? "claim" : "skip");
++    if (useful)
++    {
++      p.state = COCO_HID_CLAIM;   // réclamée dans la boucle, hors du rappel de transfert
++    }
++    else
++    {
++      cocoSetInterfaceState(device, p.iface, p.alt, ESP_ERR_NOT_ALLOWED);
++      p.inUse = false;
++    }
++  }
++}
++
++bool EspUsbHost::cocoOtherKeyboardClaimed(const DeviceState &device) const
++{
++  for (const DeviceState &other : devices_)
++  {
++    if (!other.inUse || &other == &device || other.disconnectPending)
++    {
++      continue;
++    }
++    if (other.hasKeyboardInterface)
++    {
++      return true;
++    }
++    if (other.keyboardLayoutInterface != 0xff)
++    {
++      for (uint8_t i = 0; i < other.interfaceInfoCount; i++)
++      {
++        if (other.interfaceInfos[i].number == other.keyboardLayoutInterface && other.interfaceInfos[i].claimed)
++        {
++          return true;
++        }
++      }
++    }
++  }
++  return false;
++}
++
++bool EspUsbHost::cocoClaimHidLate(DeviceState &device, uint8_t iface, uint8_t alt)
++{
++  const usb_config_desc_t *cfg = nullptr;
++  if (!device.handle || usb_host_get_active_config_descriptor(device.handle, &cfg) != ESP_OK || !cfg)
++  {
++    return false;
++  }
++  // Nouvelle passe sur les descripteurs de cette seule interface : même
++  // réclamation et même préparation des points d'accès qu'à l'énumération.
++  const uint8_t *p = reinterpret_cast<const uint8_t *>(cfg);
++  bool inTarget = false;
++  bool seen = false;
++  cocoLatePass_ = true;
++  currentDevice_ = &device;
++  for (int i = 0; i < cfg->wTotalLength;)
++  {
++    const uint8_t length = p[i];
++    if (length < 2 || i + length > cfg->wTotalLength)
++    {
++      break;
++    }
++    if (p[i + 1] == USB_INTERFACE_DESC && length >= 9)
++    {
++      const usb_intf_desc_t *intf = reinterpret_cast<const usb_intf_desc_t *>(&p[i]);
++      inTarget = intf->bInterfaceNumber == iface && intf->bAlternateSetting == alt;
++      seen = seen || inTarget;
++    }
++    if (inTarget)
++    {
++      handleDescriptor(p[i + 1], &p[i]);
++    }
++    i += length;
++  }
++  const bool claimed = seen && currentInterfaceClaimed_;
++  currentDevice_ = nullptr;
++  cocoLatePass_ = false;
++  ESP_LOGI(TAG, "CoCo3: late claim iface=%u -> %s", iface, claimed ? "OK" : esp_err_to_name(currentClaimResult_));
++  return claimed;
++}
++
++void EspUsbHost::cocoProcessPendingHid()
++{
++  const uint32_t now = millis();
++  for (CocoHidPending &p : cocoHidPending_)
++  {
++    if (!p.inUse)
++    {
++      continue;
++    }
++    DeviceState *device = findDeviceByHandle(p.handle);
++    if (!device || !device->inUse || device->disconnectPending)
++    {
++      p.inUse = false;
++      continue;
++    }
++    bool claimNow = false;
++    if (p.state == COCO_HID_CLAIM)
++    {
++      claimNow = true;
++    }
++    else if (p.state == COCO_HID_WAIT_DESC)
++    {
++      if (now - p.sinceMs >= COCO_HID_DESC_TIMEOUT_MS)
++      {
++        if (cocoConfigHasBootHid(device->handle, 0))
++        {
++          ESP_LOGI(TAG, "CoCo3: HID iface=%u no report descriptor -> skip", p.iface);
++          cocoSetInterfaceState(*device, p.iface, p.alt, ESP_ERR_NOT_ALLOWED);
++          p.inUse = false;
++          continue;
++        }
++        claimNow = true;
++      }
++    }
++    else if (p.state == COCO_HID_WAIT_SETTLE)
++    {
++      // Clavier d'un récepteur combiné : réclamé seulement quand les
++      // branchements sont calmes et qu'aucun autre clavier n'est réclamé.
++      // Reste en réserve tant qu'un autre clavier est présent.
++      // 6g : et seulement s'il reste ensuite 2 canaux libres (EP0 + clavier)
++      // pour un clavier qu'on rebrancherait : sinon le clavier en réserve
++      // prenait le dernier canal dès que le clavier principal était
++      // débranché, et celui-ci ne pouvait plus revenir.
++      if (now - p.sinceMs >= COCO_HID_SETTLE_MS &&
++          now - cocoLastNewDeviceMs_ >= COCO_HID_SETTLE_MS &&
++          !cocoOtherKeyboardClaimed(*device) &&
++          estimatedHcdChannelCount() + 1 + 2 <= maxEndpointChannelCount())
++      {
++        claimNow = true;
++      }
++    }
++    else if (p.state == COCO_HID_RETRY)
++    {
++      claimNow = now - p.sinceMs >= COCO_HID_RETRY_MS;
++    }
++    if (claimNow)
++    {
++      const uint8_t iface = p.iface, alt = p.alt, tries = p.tries;
++      p.inUse = false;
++      if (!cocoClaimHidLate(*device, iface, alt) && currentClaimResult_ == ESP_ERR_NO_MEM &&
++          tries + 1 < COCO_HID_MAX_TRIES)
++      {
++        cocoQueueRetry(device->handle, iface, alt, static_cast<uint8_t>(tries + 1));
++      }
++    }
++  }
++}
++
++void EspUsbHost::cocoForgetDevice(usb_device_handle_t handle)
++{
++  if (!handle)
++  {
++    return;
++  }
++  for (CocoHidPending &p : cocoHidPending_)
++  {
++    if (p.inUse && p.handle == handle)
++    {
++      p.inUse = false;
++    }
++  }
++}
++
++void EspUsbHost::cocoQueueRetry(usb_device_handle_t handle, uint8_t iface, uint8_t alt, uint8_t tries)
++{
++  for (CocoHidPending &p : cocoHidPending_)
++  {
++    if (!p.inUse)
++    {
++      p.inUse = true;
++      p.handle = handle;
++      p.iface = iface;
++      p.alt = alt;
++      p.state = COCO_HID_RETRY;
++      p.tries = tries;
++      p.sinceMs = millis();
++      ESP_LOGI(TAG, "CoCo3: HID iface=%u retry %u/%u after ESP_ERR_NO_MEM", iface, tries + 1, COCO_HID_MAX_TRIES);
++      return;
++    }
++  }
++}
++
++// CoCo3 6e : ESP-IDF réclame les bNumEndpoints premiers points d'accès qui
++// suivent le descripteur d'interface, dans SA copie du descripteur de
++// configuration (celle que renvoie usb_host_get_active_config_descriptor) ;
++// il libère ensuite selon le même champ. Pour une interface HID « IN + OUT
++// d'interruption », on place le IN en premier et on ramène bNumEndpoints à 1 :
++// seul le IN est réclamé. Le OUT (vibration, voyants) n'est pas utilisé par
++// l'émulateur ; les voyants du clavier passent par EP0 (SET_REPORT).
++// Renvoie true si l'interface est (ou était déjà) ainsi réduite.
++bool EspUsbHost::cocoTrimHidOut(DeviceState &device, usb_intf_desc_t *intf)
++{
++  const usb_config_desc_t *cfg = nullptr;
++  if (!intf || !device.handle || usb_host_get_active_config_descriptor(device.handle, &cfg) != ESP_OK || !cfg)
++  {
++    return false;
++  }
++  uint8_t *base = reinterpret_cast<uint8_t *>(const_cast<usb_config_desc_t *>(cfg));
++  uint8_t *end = base + cfg->wTotalLength;
++  uint8_t *pi = reinterpret_cast<uint8_t *>(intf);
++  if (pi < base || pi + 9 > end || intf->bInterfaceClass != USB_CLASS_HID_VALUE ||
++      (intf->bNumEndpoints != 1 && intf->bNumEndpoints != 2))
++  {
++    return false;
++  }
++  uint8_t *eps[3] = {nullptr, nullptr, nullptr};
++  int count = 0;
++  for (uint8_t *p = pi + pi[0]; p + 2 <= end && p[0] >= 2 && p + p[0] <= end; p += p[0])
++  {
++    if (p[1] == USB_INTERFACE_DESC)
++    {
++      break;
++    }
++    if (p[1] == USB_ENDPOINT_DESC && p[0] >= 7 && count < 3)
++    {
++      eps[count++] = p;
++    }
++  }
++  if (count != 2)
++  {
++    return false;
++  }
++  auto isIntIn = [](const uint8_t *e) { return (e[2] & 0x80) != 0 && (e[3] & 0x03) == 0x03; };
++  auto isIntOut = [](const uint8_t *e) { return (e[2] & 0x80) == 0 && (e[3] & 0x03) == 0x03; };
++  if (intf->bNumEndpoints == 1)
++  {
++    return isIntIn(eps[0]) && isIntOut(eps[1]);   // déjà réduite (passe tardive)
++  }
++  if (isIntOut(eps[0]) && isIntIn(eps[1]) && eps[0][0] == eps[1][0])
++  {
++    uint8_t tmp[16];
++    const uint8_t n = eps[0][0] < sizeof(tmp) ? eps[0][0] : sizeof(tmp);
++    memcpy(tmp, eps[0], n);
++    memcpy(eps[0], eps[1], n);
++    memcpy(eps[1], tmp, n);
++  }
++  if (!(isIntIn(eps[0]) && isIntOut(eps[1])))
++  {
++    return false;
++  }
++  intf->bNumEndpoints = 1;
++  ESP_LOGI(TAG, "CoCo3: HID iface=%u: IN ep=0x%02x only (OUT ep=0x%02x left unclaimed)",
++           intf->bInterfaceNumber, eps[0][2], eps[1][2]);
++  return true;
++}

@@ -1,0 +1,76 @@
+// ESP32-CoCo3-PRO
+// Auteur: Luc Dion 2026-10-26
+
+EspUsbHost 2.7.0 (TANAKA Masayuki, licence MIT, voir LICENSE)
+https://github.com/tanakamasayuki/EspUsbHost
+Copie fournie avec ESP32-CoCo3 a partir de la phase 6c (2026-10-02), revue en 6d.
+
+Modification ESP32-CoCo3 6c : filtre des interfaces HID.
+Recherchez « CoCo3 6c » dans EspUsbHost.h et EspUsbHost.cpp.
+
+Le controleur hote USB de l'ESP32-S3 n'a que 8 canaux : 1 par peripherique
+(EP0), 1 par point d'acces de chaque interface reclamee, et 1 de plus pour un
+hub. Sans filtre, la librairie reclame TOUTES les interfaces HID (touches
+multimedia, controle systeme, fonctions du fabricant) et le 3e peripherique
+derriere un hub echoue : « EP Alloc error: ESP_ERR_NO_MEM » (ce n'est pas la RAM).
+
+Avec le filtre (UsbHost->setHidInterfaceFilter(true), dans Setup_USB) :
+ - souris « boot » : reclamee ;
+ - clavier « boot » : reclame ; sur un recepteur combine clavier + souris,
+   reclame apres 3 s seulement si aucun autre clavier n'est branche (sinon en
+   reserve, reclame si l'autre clavier est debranche) ;
+ - autres interfaces HID : classees par leur descripteur de rapport ; clavier,
+   souris (si pas deja de souris « boot ») et manette/joystick reclames, le
+   reste ignore.
+
+6d : EspUsbHostConfig::hostTaskStackSize (pile de la tache hote, 0 = taskStackSize),
+hostTaskStackFree() / clientTaskStackFree() ; interface ignoree par le filtre =
+ESP_ERR_NOT_ALLOWED (ESP_ERR_NOT_SUPPORTED = plus de canal chez ESP-IDF) ;
+reclamation HID echouee par ESP_ERR_NO_MEM (RAM interne DMA) : nouvelle
+tentative toutes les 1,5 s, 5 fois au plus.
+NB : ESP_ERR_NO_MEM vient de la RAM interne DMA (listes de descripteurs de
+chaque canal, alignees sur 512 o), pas du nombre de canaux.
+
+6e : interface HID avec points d'acces d'interruption IN + OUT (manettes :
+vibration, voyants) : seul le IN est reclame (cocoTrimHidOut : IN place en
+premier et bNumEndpoints = 1 dans la copie du descripteur de configuration
+tenue par ESP-IDF). Economie : 1 canal par manette.
+
+6f : un rapport HID dont le 1er octet vaut 1 n'est decode comme clavier que
+sur une interface clavier (protocole boot 1 ou page Keyboard dans son
+descripteur) : avant, une manette dont le rapport porte le n. 1 produisait
+des touches fantomes.
+
+6g : le clavier en reserve d'un recepteur combine n'est reclame que s'il
+reste ensuite 2 canaux libres (EP0 + clavier) pour le retour du clavier
+principal.
+
+7t10 : priorite au clavier. Le canal EP0 de chaque appareil est pris par
+ESP-IDF a l'enumeration (hors de notre controle) ; les interfaces sont
+reclamees dans cocoProcessPendingHid :
+ - claviers tout de suite ;
+ - manettes et souris (y compris souris « boot ») 1,5 s apres le dernier
+   branchement (COCO_ENUM_CALM_MS) ; tant qu'aucun clavier n'est reclame,
+   elles laissent 2 canaux libres (3 si le clavier d'un recepteur combine
+   attend) : cocoPadGateOk ;
+ - interface sans canal (ESP_ERR_NOT_SUPPORTED) : etat COCO_HID_WAIT_CHANNEL,
+   reclamee des qu'un canal se libere ;
+ - clavier sans canal : l'appareil dont une interface manette / souris a ete
+   reclamee le plus recemment la cede (cocoPreemptForKeyboard : halt + flush,
+   puis COCO_HID_RELEASE : clear, transfer_free, interface_release) ; elle
+   repasse en attente d'un canal. Les manettes Xbox (classe vendeur) ne cedent
+   pas leur place (pas de reclamation tardive possible). cocoPreemptCount().
+
+7t11 : clavier d'un recepteur combine sans autre clavier = LE clavier :
+reclame avec un seul canal libre (la reserve de 2 canaux de la 6g ne vaut plus
+que s'il y a un autre clavier, cas ou il n'est de toute facon pas reclame) ;
+sans canal, une manette / souris lui cede le sien. Manettes et souris : 1 canal
+garde pour un clavier deja branche en attente, 2 si aucun clavier.
+
+7t12 : cocoPadGateOk refuse toujours au-dela des canaux estimes (avant : avec
+un clavier actif, seule l'attente de calme comptait). Une reclamation tardive
+qui echoue par ESP_ERR_NO_MEM (ESP-IDF le rend aussi quand les canaux manquent,
+ou quand la RAM DMA est morcelee) passe, apres ses essais, en attente d'un canal
+(COCO_HID_WAIT_CHANNEL) au lieu d'etre abandonnee.
+
+Les fichiers modif_*.diff montrent les changements par rapport a la 2.7.0.

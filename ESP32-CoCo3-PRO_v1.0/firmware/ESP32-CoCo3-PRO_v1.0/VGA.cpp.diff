@@ -1,0 +1,89 @@
+--- vga/VGA.cpp.orig	2026-09-25 14:18:13.157115270 -0400
++++ vga/VGA.cpp	2026-09-25 14:18:13.168766853 -0400
+@@ -4,6 +4,7 @@
+  * File         : VGA.cpp
+  *
+  * Updated      : 2026-08-30 by Luc Dion
++ *                2026-09-25 diviseur d'horloge fractionnaire (mode 640 GIME)
+  *
+  *  ******************************************************************************/
+ 
+@@ -32,6 +33,37 @@
+ 	temp_reg.reg_field = (field_val);                       \
+ 	(base_reg).val = temp_reg.val;                          \
+ }
++
++// Diviseur d'horloge LCD_CAM : f = 240 MHz / (N + B/A).
++// Comportement d'origine conservé : diviseur ENTIER (A = B = 0) dès que
++// l'arrondi entier tombe à moins de 2 % de la fréquence demandée (c'est le
++// cas de tous les modes existants, ex. 12 587 500 Hz -> N = 19, 12,63 MHz).
++// Sinon (ex. mode 640 GIME à 25 263 158 Hz = 240/9,5 MHz, soit exactement
++// 2 x l'horloge du mode 320 4:3), partie fractionnaire B/A (A <= 63, B < A)
++// pour obtenir un balayage identique au mode 320 : même fréquence ligne et
++// trame, le moniteur ne resynchronise pas (ou très peu) au changement.
++static void computeClockDivider(int frequency, int &N, int &divA, int &divB)
++{
++	const double div = 240000000.0 / (double)frequency;
++	N    = (int)round(div);
++	divA = 0;
++	divB = 0;
++	if (N < 2) N = 2;
++	if (fabs(240000000.0 / N - frequency) <= 0.02 * frequency)
++		return;
++	N = (int)floor(div);
++	if (N < 2) N = 2;
++	const double frac = div - N;
++	double bestErr = 1.0;
++	for (int a = 2; a <= 63; a++)
++	{
++		int b = (int)round(frac * a);
++		if (b <= 0 || b >= a) continue;
++		double err = fabs(frac - (double)b / a);
++		if (err < bestErr - 1e-9) { bestErr = err; divA = a; divB = b; }
++	}
++}
++
+ VGA::VGA()
+ {
+ 	bufferCount = 1;
+@@ -91,16 +123,16 @@
+ 	
+ 	//f=240000000/(n+1)
+ 	//n=240000000/f-1;
+-	int N = round(240000000.0/(double)mode.frequency);
+-	if(N < 2) N = 2;
++	int N, divA, divB;
++	computeClockDivider(mode.frequency, N, divA, divB);
+ 	//clk = source / (N + b/a)
+ 	//this->pins = 48;
+ 	LCD_CAM.lcd_clock.clk_en = 1;
+ 	LCD_CAM.lcd_clock.lcd_clk_sel = 2;			// PLL240M
+ 	// - For integer divider, LCD_CAM_LCD_CLKM_DIV_A and LCD_CAM_LCD_CLKM_DIV_B are cleared.
+ 	// - For fractional divider, the value of LCD_CAM_LCD_CLKM_DIV_B should be less than the value of LCD_CAM_LCD_CLKM_DIV_A.
+-	LCD_CAM.lcd_clock.lcd_clkm_div_a = 0;
+-	LCD_CAM.lcd_clock.lcd_clkm_div_b = 0;
++	LCD_CAM.lcd_clock.lcd_clkm_div_a = divA;
++	LCD_CAM.lcd_clock.lcd_clkm_div_b = divB;
+ 	LCD_CAM.lcd_clock.lcd_clkm_div_num = N; 	// 0 => 256; 1 => 2; 14 compfy
+ 	LCD_CAM.lcd_clock.lcd_ck_out_edge = 0;		
+ 	LCD_CAM.lcd_clock.lcd_ck_idle_edge = 0;
+@@ -221,15 +253,15 @@
+ 	
+ 	//f=240000000/(n+1)
+ 	//n=240000000/f-1;
+-	int N = round(240000000.0/(double)mode.frequency);
+-	if(N < 2) N = 2;
++	int N, divA, divB;
++	computeClockDivider(mode.frequency, N, divA, divB);
+ 	//clk = source / (N + b/a)
+ 	LCD_CAM.lcd_clock.clk_en = 1;
+ 	LCD_CAM.lcd_clock.lcd_clk_sel = 2;			// PLL240M
+ 	// - For integer divider, LCD_CAM_LCD_CLKM_DIV_A and LCD_CAM_LCD_CLKM_DIV_B are cleared.
+ 	// - For fractional divider, the value of LCD_CAM_LCD_CLKM_DIV_B should be less than the value of LCD_CAM_LCD_CLKM_DIV_A.
+-	LCD_CAM.lcd_clock.lcd_clkm_div_a = 0;
+-	LCD_CAM.lcd_clock.lcd_clkm_div_b = 0;
++	LCD_CAM.lcd_clock.lcd_clkm_div_a = divA;
++	LCD_CAM.lcd_clock.lcd_clkm_div_b = divB;
+ 	LCD_CAM.lcd_clock.lcd_clkm_div_num = N; 	// 0 => 256; 1 => 2; 14 compfy
+ 	LCD_CAM.lcd_clock.lcd_ck_out_edge = 0;		
+ 	LCD_CAM.lcd_clock.lcd_ck_idle_edge = 0;
