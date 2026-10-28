@@ -7,5 +7,4 @@ Experience cycle-accurate MC6809/ HD6309 CoCo3 emulation with true GIME graphics
 
 Pure and crisp VGA output, use your modern USB 2.0 keyboard / mouse / game controller, enjoy easy and reliable SD card storage, connect with the outside world thanks to Wi-Fi connectivity including easy CoCo-PC file sharing, stereo sound, and more!
 
-[![https://youtube.com/playlist?list=PLXJt_qb6jfIU&si=-o1SbdBaAezFFh5u](https://shields.io)](https://youtube.com)
-
+https://youtube.com/playlist?list=PLXJt_qb6jfIU&si=tbwsA73mpO9cE1bf
