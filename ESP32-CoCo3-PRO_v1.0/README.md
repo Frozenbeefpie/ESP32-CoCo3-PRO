@@ -25,7 +25,7 @@ Version **1.0** — October 2026 — by **Luc Dion**, inspired by ESP32-CoCo2 by
 
 ## Installing the firmware
 
-Download `ESP32-CoCo3-PRO_v1.0.FLH` (or `.BIN`) from the [[Releases](https://github.com/Frozenbeefpie/ESP32-CoCo3-PRO/releases) page, copy it into
+Download `ESP32-CoCo3-PRO_v1.0.FLH` (or `.BIN`) from the [Releases](https://github.com/Frozenbeefpie/ESP32-CoCo3-PRO/releases) page, copy it into
 the `/FLASHNOW` folder of the SD card and power the board: it is installed at start-up (black screen
 for about 20 s — do not cut the power). The previous version stays in the other flash slot
 (F12 > SYSTEM > PREVIOUS VERSION).
