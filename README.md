@@ -9,6 +9,8 @@ Experience cycle-accurate MC6809/ HD6309 CoCo3 emulation with true GIME graphics
 
 Pure and crisp VGA output, use your modern USB 2.0 keyboard / mouse / game controller, enjoy easy and reliable SD card storage, connect with the outside world thanks to Wi-Fi connectivity including easy CoCo-PC file sharing, stereo sound, and more!
 
+Visit our Facebook group page ESP32-CoCo: https://www.facebook.com/groups/4262638377332924
+
 **************************************************
 
 ⚠️ DISCLAIMER & RISK WARNING — ESP32 FIRMWARE FLASHING ⚠️
